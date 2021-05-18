@@ -199,9 +199,11 @@ const int TrackClocks = SysClock / (360 / 60);  // 360 RPM
 const int TrackEnd = TrackClocks * 15 / 16;
 
 const int BitClocks = SysClock / 1000000 * 5 / 3;  // 1.67 us
-const int HistogramSize = BitClocks * 9;  // 4.5 slow bit times max
+const int HistogramSize = BitClocks * 9 / 2;  // 4.5 bit times max   * 2 if slow
 int histogram[HistogramSize];
 
+// 80 MHz 2/3/4 us
+int bitTime1p5 = 200 - 13;
 int bitTime2p5 = 333 + 13;
 int bitTime3p5 = 467 - 17;
 
@@ -224,16 +226,14 @@ void readTrack(int side = 0, int density = 0) {
 
 	int mfmBits = 1;
 	int mfmPos = 1;  // clock then data
+	int runtTime = 0;
 
 	while (1) {
 	  while (!(WTIMER3_RIS_R & TIMER_RIS_CAERIS))  { // wait for neg edge capture vs. interrupt?
 		if ((int)WTIMER3_TAV_R - trackEnd > 0) {
 	   	  if (!GPIO_PORTD_DATA_BITS_R[Index]
-		  || (int)WTIMER3_TAV_R - noDataEnd > 0 // prevent stuck when no data
-		  ) {
-		    GPIO_PORTE_DATA_BITS_R[Side0 | HiDensity] = 0xFF;  // keep current low
-		    return;
-	   	  }
+		  || (int)WTIMER3_TAV_R - noDataEnd > 0 // prevent stuck if no data
+		  ) return;
 		}
 	  }
 
@@ -241,25 +241,32 @@ void readTrack(int side = 0, int density = 0) {
 	  prevEdgeTime = (int)WTIMER3_TAR_R;
       WTIMER3_ICR_R |= TIMER_ICR_CAECINT; // clear status
 
-	  if (bitInterval < HistogramSize) {
-		 histogram[bitInterval]++; // diagnostic
-		 int bitCount;
-		 if (bitInterval < bitTime2p5)
-		   bitCount = 2;
-		 else if (bitInterval < bitTime3p5)
-			bitCount = 3;
-		 else bitCount = 4;
+      bitInterval += runtTime;
 
-		 mfmBits <<= bitCount;
-		 mfmBits |= 1;
+	  if (bitInterval >= HistogramSize)
+		continue;
 
-		 if ((mfmPos += bitCount) >= 8) {
-		   mfmPos -= 8;
-		   sendByte((mfmBits >> mfmPos) & 0xFF);
-		 }
-	  } else { // out of synch
-		  mfmPos = 1;
-		  mfmBits = 1;
+	  histogram[bitInterval]++; // diagnostic
+
+	  if (bitInterval < bitTime1p5) {
+		runtTime = bitInterval;
+		continue;
+	  }
+	  runtTime = 0;
+
+	  int bitCount;
+	  if (bitInterval < bitTime2p5)
+		bitCount = 2;
+	  else if (bitInterval < bitTime3p5)
+		bitCount = 3;
+	  else bitCount = 4;
+
+	  mfmBits <<= bitCount;
+	  mfmBits |= 1;
+
+  	  if ((mfmPos += bitCount) >= 8) {
+		  mfmPos -= 8;
+		sendByte((mfmBits >> mfmPos) & 0xFF);
 	  }
 	}
 }
@@ -298,8 +305,8 @@ int main(void) {
 
 	     case 'A' :  // adjust timing
 	    	 delay_ms(16); // Rx FIFO should have values
-	    	 p = (unsigned char*)&bitTime2p5;
-	    	 for (int count = 8; count--;)
+	    	 p = (unsigned char*)&bitTime1p5;
+	    	 for (int count = 3 * sizeof(int); count--;)
 	    		*p++ = UART1_DR_R;
 	    	 break;
 
@@ -308,7 +315,10 @@ int main(void) {
 	     case 'D' : readTrack(0, 1); break; // HiDensity
 	  }
 
-	  if (!GPIO_PORTE_DATA_BITS_R[MotorOff] && (WTIMER3_TAV_R - motorTimeout) > 0) motor(false);
+	  if (!GPIO_PORTE_DATA_BITS_R[MotorOff] && (WTIMER3_TAV_R - motorTimeout) > 0) {
+		  motor(false);
+		  GPIO_PORTE_DATA_BITS_R[Side0 | HiDensity] = 0xFF;  // keep current low
+	  }
 
 	  if (!GPIO_PORTF_DATA_BITS_R[SW1]) { // SW1 pressed
 		readTrack();
