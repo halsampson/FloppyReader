@@ -1,4 +1,4 @@
-// Floppy.cpp: Get data from FDD LMF4120 MCU
+// Floppy.cpp: Interprets MFM data sent from FDD MFMReader on LMF4120 MCU
 
 #include <Windows.h>
 #include <stdio.h>
@@ -53,8 +53,8 @@ HANDLE openSerial(const char* portName) {
 
   // USB bulk packets arrive at 1 kHz rate
   COMMTIMEOUTS timeouts = { 0 };  // in ms
-  timeouts.ReadIntervalTimeout = 500;
-  timeouts.ReadTotalTimeoutConstant = 500;
+  timeouts.ReadIntervalTimeout = 500 + 167 * 2;
+  timeouts.ReadTotalTimeoutConstant = 500 + 167 * 2; // spin up + index
   timeouts.ReadTotalTimeoutMultiplier = 0;
   if (!SetCommTimeouts(hCom, &timeouts))  printf("Can't SetCommTimeouts");
 
@@ -139,9 +139,8 @@ int getBit() {
   return (mfm[bytePos] >> bitPos) & 1;
 }
 
-UINT8 decoded[12000];
-
 struct {
+  UINT8  synch[12];
   UINT32 IDAM; // ID Address Mark 0xA1A1A1FE
   UINT8 track;
   UINT8 side;
@@ -157,7 +156,11 @@ struct {
 } sector;
 
 
-void decodeMFM(int phaseOfs = 1) {
+FILE* fImg;
+
+int decodeMFMtrack() {  // returns errorCount
+  int errorCount = 0;
+
   bytePos = 0; // could skip 130+ bytes header
   bitPos = 0;
 
@@ -165,12 +168,12 @@ void decodeMFM(int phaseOfs = 1) {
   int dataMFMbits = 0;
   int dataBits = 0;
 
-  UINT8* pSector = NULL;
+  UINT8* pSector = sector.synch;
   sector.sectorSizeID = 0;  // assume small until overwritten
 
   ULONG64 mfmBits = 0;
 
-  while (bytePos < mfmBytes) {
+  while (bytePos < (int)mfmBytes) {
     mfmBits <<= 1;
     int mfmBit = getBit();
     mfmBits |= mfmBit;
@@ -190,69 +193,125 @@ void decodeMFM(int phaseOfs = 1) {
         *pSector++ = data;
     }
 
-    int sectorLen = 128 << sector.sectorSizeID;
+    int sectorLen = min(128 << sector.sectorSizeID, 512);
 
     if (pSector > &sector.data[sectorLen] + sizeof(sector.dataCRC)) {
       pSector = NULL;
-      printf("Side %d ", sector.side);
-      printf("Track %2d ", sector.track);
-      printf("Sector %d ", sector.sector); 
-      if (sector.sector == 1) printf("Len %3d ", sectorLen);
+      static int lastSide = -1, lastTrack = -1;
+      if (sector.side != lastSide) printf("Side %d ", lastSide = sector.side);
+      if (sector.track != lastTrack) printf("\nTrack %2d ", lastTrack = sector.track);      
+      if (sector.sector == 1) printf("Len %3d Sectors %d ", sectorLen, 1);
+      else  printf("%d ", sector.sector);
 
-      if (sector.DAM != 0xFBA1A1A1) printf("DAM! %8X ", sector.DAM);
+      if (sector.DAM != 0xFBA1A1A1) {
+        printf("DAM! %8X ", sector.DAM);
+        ++errorCount;
+      }
 
       UINT16 dCRC = crc16_block((UINT8*)&sector.DAM, sizeof(sector.DAM) + sectorLen, 0xFFFF);
       dCRC = _byteswap_ushort(dCRC);
-      if (dCRC != sector.dataCRC)
-        printf("CRC! %4X %4X ", dCRC, sector.dataCRC);
+      if (dCRC != sector.dataCRC) {
+        printf("\tCRC %4X != %4X\n", dCRC, sector.dataCRC);
+        ++errorCount;
+      }
 
-      // if (datab >= ' ' && datab <= 'z')
-      //  printf("%c", datab);
+      if (fImg) fwrite(sector.data, 1, sectorLen, fImg);
     }
   }
+  return errorCount;
 }
 
-void getData(void) {
-  Sleep(500 + 200); // spin up + index detect
-
+int getData(void) {
   ReadFile(hCom, mfm, sizeof(mfm), &mfmBytes, NULL);
-  // printf("\r%d ", mfmBytes);
-
-  decodeMFM();
+  if (mfmBytes < 12000) printf("Got %d ", mfmBytes);
+  return decodeMFMtrack(); // error count
 }
 
-  
-void plotHistogram() {
-  InvalidateRect(consoleWnd, NULL, TRUE); Sleep(16);
-  for (int line = 16; line--;) printf("\n");
 
+#if 1 // 55GFR 2/3/4 us
+  int bitTime2p5 = 333 + 12;
+  int bitTime3p5 = 467 - 14;
+#else // 55BV  4/6/8 us
+  int bitTime2p5 = 400;
+  int bitTime3p5 = bitTime2p5 * 35 / 25;
+#endif
+
+
+unsigned int hist[80 * 5 / 3 * 9];
+
+void plotHistogram() {
   sendCmd('H');
-  unsigned int hist[80 * 5 / 3 * 9 / 2];
   DWORD gotBytes;
   ReadFile(hCom, hist, sizeof(hist), &gotBytes, NULL);
 
   x = 0;
-  for (DWORD x = 0; x < gotBytes / sizeof(int); x++)
-    plot((int)(log(hist[x] + 1) * 20));
+  for (DWORD x = 0; x < gotBytes / sizeof(int); x++) {
+    if (x == bitTime2p5 || x == bitTime3p5) { // time threshold markers
+      int y = 64;
+      while (y--)
+        SetPixel(console, x, yOfs - y, RGB(255, 255, 0));
+    }
+    plot((int)(logf(hist[x] + 1) * 20));
+  }
 }
 
+void adjustTiming(void) {
+  WriteFile(hCom, &bitTime2p5, 8, NULL, NULL);
+}
 
 int main() {
   openSerial("COM10");
+
+  sendCmd('I');
+  char id[64] = { 0 };
+  ReadFile(hCom, id, sizeof(id), NULL, NULL);
+  printf("%s\n", id);
+
+  adjustTiming(); // TODO: dynamic based on histogram
+
   consoleGraph();
   crc16_init();
+
+  char imgFileName[] = "floppy.1.img";
   
   while (1) {
     while (!_kbhit());
     char cmd = toupper(_getch());
     switch (cmd) { 
-      case 'H': plotHistogram(); break;
-      case 'D': decodeMFM(0); break;
+      case 'I' : // dump .IMG file
+        if (fopen_s(&fImg, imgFileName, "wb")) {
+          printf("Can't open %s\n", imgFileName);
+          break;
+        }
+        ++imgFileName[7];
+        sendCmd('S');
+        sendCmd('Z');  Sleep(40 * 5);
+        for (int track = 0; track < 40; track++) {
+          sendCmd('R');          
+          if (track == 0) Sleep(500);
+          if (getData() > 8) break; // errors
+          plotHistogram();
+          if (_kbhit()) break;
+          sendCmd('S');
+        }
+        if (fImg) {fclose(fImg); fImg = 0;}
+        break;
+
+      case 'H': 
+        plotHistogram(); 
+        break;
+
+      case ' ': 
+        InvalidateRect(consoleWnd, NULL, true); 
+        system("CLS");
+        break;
 
       default: 
         sendCmd(cmd); 
-        if (cmd == 'R' || cmd == 'T' || cmd == 'D') {
+        if (cmd == 'R' || cmd == 'T') {
+          Sleep(500);
           getData();
+          plotHistogram();
           sendCmd('S');
         }
         break;

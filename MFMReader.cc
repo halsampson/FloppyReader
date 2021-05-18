@@ -114,8 +114,8 @@ inline void sendByte(unsigned char c) {
 }
 
 void sendStr(char* str) {
-	int timeout = SysClock * 10 / BaudRate;
 	while (*str) {
+	   int timeout = 8 * SysClock * 10 / BaudRate;
 	   while (!(UART1_RIS_R & UART_RIS_TXRIS) && timeout-- > 0); // room in Tx FIFO
  	   sendByte(*str++);
 	}
@@ -160,7 +160,7 @@ void delay_ms(int ms) {
 
 void step(bool out = false) {
   if (!out) {
-	GPIO_PORTE_DATA_BITS_R[Direction] = 0;
+	GPIO_PORTE_DATA_BITS_R[Direction] = 0; // step in
 	delay_ms(10);
   }
 
@@ -170,6 +170,9 @@ void step(bool out = false) {
   delay_ms(3);
   GPIO_PORTE_DATA_BITS_R[Direction] = Direction;  // keep Hi vs. total current limit
 }
+
+
+int motorTimeout;
 
 void motor(bool on = true) {
   GPIO_PORTE_DATA_BITS_R[MotorOff] = on ? 0 : MotorOff;
@@ -196,8 +199,11 @@ const int TrackClocks = SysClock / (360 / 60);  // 360 RPM
 const int TrackEnd = TrackClocks * 15 / 16;
 
 const int BitClocks = SysClock / 1000000 * 5 / 3;  // 1.67 us
-const int HistogramSize = BitClocks * 9 / 2;  // 4.5 bit times max
+const int HistogramSize = BitClocks * 9;  // 4.5 slow bit times max
 int histogram[HistogramSize];
+
+int bitTime2p5 = 333 + 13;
+int bitTime3p5 = 467 - 17;
 
 void readTrack(int side = 0, int density = 0) {
 	GPIO_PORTE_DATA_BITS_R[HiDensity] = density ? 0 : HiDensity;  // also 2 steps for 48 tpi
@@ -205,8 +211,9 @@ void readTrack(int side = 0, int density = 0) {
 
 	if (GPIO_PORTE_DATA_BITS_R[MotorOff]) {
 	  motor();
-	  delay_ms(500); // up to speed
+	  delay_ms(500); // wait until up to speed
 	}
+	motorTimeout = (int)WTIMER3_TAV_R + SysClock;
 
 	while (GPIO_PORTD_DATA_BITS_R[Index]); //wait for index hole
 
@@ -225,7 +232,6 @@ void readTrack(int side = 0, int density = 0) {
 		  || (int)WTIMER3_TAV_R - noDataEnd > 0 // prevent stuck when no data
 		  ) {
 		    GPIO_PORTE_DATA_BITS_R[Side0 | HiDensity] = 0xFF;  // keep current low
-		    motor(false);
 		    return;
 	   	  }
 		}
@@ -237,12 +243,17 @@ void readTrack(int side = 0, int density = 0) {
 
 	  if (bitInterval < HistogramSize) {
 		 histogram[bitInterval]++; // diagnostic
-		 bitInterval += BitClocks / 2;  // round
-		 bitInterval /= BitClocks;  // 2, 3 or 4
-		 mfmBits <<= bitInterval;
+		 int bitCount;
+		 if (bitInterval < bitTime2p5)
+		   bitCount = 2;
+		 else if (bitInterval < bitTime3p5)
+			bitCount = 3;
+		 else bitCount = 4;
+
+		 mfmBits <<= bitCount;
 		 mfmBits |= 1;
 
-		 if ((mfmPos += bitInterval) >= 8) {
+		 if ((mfmPos += bitCount) >= 8) {
 		   mfmPos -= 8;
 		   sendByte((mfmBits >> mfmPos) & 0xFF);
 		 }
@@ -271,25 +282,33 @@ int main(void) {
 	     case 'B' : step(true); step(true); break; // Back
 	     case 'S' : step(); step(); break;
 	     case 'Q' : step(); break;  // 96 tpi only
-
 	     case 'Z' : while (GPIO_PORTD_DATA_BITS_R[Track00]) step(true); break;  // to track Zero
+
 	     case 'R' : readTrack(); break;
-	     case 'T' : readTrack(1); break;
+	     case 'T' : readTrack(1); break; // side 1
 	     case 'H' :
 	    	 unsigned char* p = (unsigned char*)&histogram;
 	    	 for (int i = 0; i < sizeof(histogram); i++) {
-	    	   int timeout = SysClock  * 10 / BaudRate;
+	    	   int timeout = 8 * SysClock * 10 / BaudRate;
 	    	   while (!(UART1_RIS_R & UART_RIS_TXRIS) && timeout-- > 0); // wait for 8 bytes room in Tx FIFO
 	    	   sendByte(*p);
 	    	   *p++ = 0;
 	         }
 	         break;
 
-	     case 'I' :
-	    	 sendStr("FDD reader " __DATE__ " " __TIME__ "\n"); break;
+	     case 'A' :  // adjust timing
+	    	 delay_ms(16); // Rx FIFO should have values
+	    	 p = (unsigned char*)&bitTime2p5;
+	    	 for (int count = 8; count--;)
+	    		*p++ = UART1_DR_R;
+	    	 break;
+
+	     case 'I' : sendStr("FDD MFM reader " __DATE__ " " __TIME__ "\n"); break;
 
 	     case 'D' : readTrack(0, 1); break; // HiDensity
 	  }
+
+	  if (!GPIO_PORTE_DATA_BITS_R[MotorOff] && (WTIMER3_TAV_R - motorTimeout) > 0) motor(false);
 
 	  if (!GPIO_PORTF_DATA_BITS_R[SW1]) { // SW1 pressed
 		readTrack();
