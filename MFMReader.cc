@@ -3,6 +3,8 @@
 // for TI LM4F120XL dev board
 // send MFM data to FloppyReader.cpp
 
+// TODO: reread WTIMER3_TAV_R until close value??
+
 #include "inc\lm4f120h5qr.h"
 #include "inc/hw_memmap.h"
 #include "inc/hw_types.h"
@@ -259,10 +261,12 @@ void readTrack(int side = 0, int density = 0) {
 		if ((int)WTIMER3_TAV_R - revPastIndex > 0) {
 	   	  if (!GPIO_PORTD_DATA_BITS_R[Index]) // index hole at end of track
 	   		  return; // done with track
+#if 0
           if ((int)WTIMER3_TAV_R - noDataEnd > 0) { // prevent stuck if no data
         	sendByte('D'); // no Data
 		    return;
           }
+#endif
 		}
 	  }
 

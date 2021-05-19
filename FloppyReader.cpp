@@ -179,7 +179,7 @@ int decodeMFMtrack() {  // returns errorCount
   int dataMFMbits = 0;
   int dataBits = 0;
 
-  UINT8* pSector = sector.synch; // to look at pre-header synch
+  UINT8* pSector = NULL; //  sector.synch; // to look at pre-header synch
   sector.sectorSizeID = 0;  // assume small until overwritten
 
   ULONG64 mfmBits = 0;
@@ -223,11 +223,17 @@ int decodeMFMtrack() {  // returns errorCount
       UINT16 dCRC = crc16_block((UINT8*)&sector.DAM, sizeof(sector.DAM) + sectorLen, 0xFFFF);
       dCRC = _byteswap_ushort(dCRC);
       if (dCRC != sector.dataCRC) {
+        if (sector.side > 1 || sector.track > 39 || sector.sector > 9 || sectorLen != 512) {
+          printf("skipping intersector junk\n");
+          continue;
+        }
         printf("\tCRC %4X != %4X\n", dCRC, sector.dataCRC);
         ++errorCount;
       }
 
       if (fImg) fwrite(sector.data, 1, sectorLen, fImg);
+
+      if (sector.sector == 9) return errorCount;  // don't scan through garbage (could check BPB)
     }
   }
   return errorCount;
