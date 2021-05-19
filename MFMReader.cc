@@ -1,9 +1,8 @@
 // FDD MFM reader
 
 // for TI LM4F120XL dev board
-// send MFM data to FloppyReader.cpp
+// sends MFM data to FloppyReader.cpp
 
-// TODO: reread WTIMER3_TAV_R until close value??
 
 #include "inc\lm4f120h5qr.h"
 #include "inc/hw_memmap.h"
@@ -180,7 +179,7 @@ void step(bool out = false) {
 }
 
 
-int motorTimeout;
+unsigned int motorTimeout;
 
 void motor(bool on = true) {
   GPIO_PORTE_DATA_BITS_R[MotorOff] = on ? 0 : MotorOff;
@@ -229,30 +228,26 @@ void readTrack(int side = 0, int density = 0) {
 	  motor();
 	  delay_ms(500); // wait until up to speed
 	}
-	motorTimeout = (int)WTIMER3_TAV_R + SysClock; // 1 second
+	motorTimeout = WTIMER3_TAV_R + SysClock; // 1 second
 
-	int indexTimeout = (int)WTIMER3_TAV_R + 60 * RevClocks;
+	unsigned int indexTimeout = WTIMER3_TAV_R + 3 * RevClocks;
 	while (!(GPIO_PORTD_DATA_BITS_R[Index])) { //wait for no index hole
-#if 0
-	  if ((int)WTIMER3_TAV_R - indexTimeout > 0) {
+	  if ((int)(WTIMER3_TAV_R - indexTimeout) > 0) {
 		sendByte('H');  // status: stuck at index Hole
 		return;
 	  }
-#endif
 	}
+
 	while (GPIO_PORTD_DATA_BITS_R[Index]) { //wait for index hole
-#if 0
-	  if ((int)WTIMER3_TAV_R - indexTimeout > 0) {
+	  if ((int)(WTIMER3_TAV_R - indexTimeout) > 0) {
 		sendByte('I'); // status: no Index -- WHY??
 		return;
 	  }
-#endif
-	 }
+	}
 
-
-	int revPastIndex = (int)WTIMER3_TAV_R + PastIndex;
-	int noDataEnd = (int)WTIMER3_TAV_R + 2 * RevClocks;
-	int prevEdgeTime = (int)WTIMER3_TAR_R;
+	unsigned int revPastIndex = WTIMER3_TAV_R + PastIndex;
+	unsigned int noDataEnd = WTIMER3_TAV_R + 2 * RevClocks;
+	unsigned int prevEdgeTime = WTIMER3_TAR_R;
 
 	int mfmBits = 1;
 	int mfmPos = 1;  // clock then data
@@ -260,20 +255,18 @@ void readTrack(int side = 0, int density = 0) {
 
 	while (1) {
 	  while (!(WTIMER3_RIS_R & TIMER_RIS_CAERIS))  { // wait for neg edge capture vs. interrupt?
-		if ((int)WTIMER3_TAV_R - revPastIndex > 0) {
+		if ((int)(WTIMER3_TAV_R - revPastIndex) > 0) {
 	   	  if (!GPIO_PORTD_DATA_BITS_R[Index]) // index hole at end of track
 	   		  return; // done with track
-#if 0
-          if ((int)WTIMER3_TAV_R - noDataEnd > 0) { // prevent stuck if no data
+          if ((int)(WTIMER3_TAV_R - noDataEnd) > 0) { // prevent stuck if no data
         	sendByte('D'); // no Data
 		    return;
           }
-#endif
 		}
 	  }
 
-	  int bitInterval = (int)WTIMER3_TAR_R - prevEdgeTime; // captured count between neg edges
-	  prevEdgeTime = (int)WTIMER3_TAR_R;
+	  int bitInterval = WTIMER3_TAR_R - prevEdgeTime; // captured count between neg edges
+	  prevEdgeTime = WTIMER3_TAR_R;
       WTIMER3_ICR_R |= TIMER_ICR_CAECINT; // clear status
 
       bitInterval += runtTime;
@@ -350,7 +343,7 @@ int main(void) {
 	    	 break;
 
 	     case 'M' :
-	    	 motorTimeout = (int)WTIMER3_TAV_R + SysClock; // 1 second
+	    	 motorTimeout = WTIMER3_TAV_R + SysClock; // 1 second
 	         motor();
 	         break;
 
@@ -359,7 +352,7 @@ int main(void) {
 	     case 'D' : readTrack(0, 1); break; // HiDensity
 	  }
 
-	  if (!GPIO_PORTE_DATA_BITS_R[MotorOff] && ((int)WTIMER3_TAV_R - motorTimeout) > 0) {
+	  if (!GPIO_PORTE_DATA_BITS_R[MotorOff] && (int)(WTIMER3_TAV_R - motorTimeout) > 0) {
 		  motor(false);
 		  GPIO_PORTE_DATA_BITS_R[Side0 | HiDensity] = 0xFF;  // keep current low
 	  }
