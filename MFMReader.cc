@@ -11,12 +11,10 @@
 
 
 // High density floppy can generate transitions every < 1us, taking 2 bits to send timing interval
-// so BaudRate should be 2 * 10 / 8  > 2.5 MBit
-// FTDI supports 3 Mbit
-
+// so BaudRate should be > 2 * 10 / 8  = 2.5 MBaud
 const int BaudRate = 3000000;
 
-/*
+/* special pins to avoid
 PB0 3.6V max
 PB1 3.6V max
 
@@ -67,9 +65,9 @@ void initUART0(void) {
 
 	int baud = BaudRate;
 	if (baud * 16 > SysClock) {
-		UART0_CTL_R |= UART_CTL_HSE; // 8 * BaudRate
+		UART0_CTL_R |= UART_CTL_HSE; // UART clock = 8 * BaudRate
 		baud /= 2;
-	} else UART0_CTL_R &= ~UART_CTL_HSE;
+	} else UART0_CTL_R &= ~UART_CTL_HSE; // UART clock = 16 * BaudRate
 	int baudX64 = (SysClock * 8 / baud + 1) / 2;
 	UART0_IBRD_R = baudX64 / 64;
 	UART0_FBRD_R = baudX64 % 64;
@@ -82,8 +80,6 @@ void initUART0(void) {
 	GPIO_PORTA_DEN_R = U0Rx | U0Tx;
     GPIO_PORTA_PCTL_R |= 0x11;  // pins 0 and 1 default
     GPIO_PORTA_AMSEL_R &= ~(U0Rx | U0Tx);
-
-    // if (UART0_FR_R & UART_FR_RXFE) recv(UAR0_DR_R & 0xFF);
 }
 
 
@@ -106,28 +102,38 @@ void initUART1(void) {
 	UART1_FBRD_R = baudX64 % 64;
 	UART1_LCRH_R = UART_LCRH_WLEN_8 | UART_LCRH_FEN; //  FIFO doesn't help long string of 0s or 1s much
 	UART1_CC_R = 0;  // SysClock default
-	UART1_CTL_R |= UART_CTL_RXE | UART_CTL_TXE | UART_CTL_UARTEN; //  | UART_CTL_HSE for / 8
+	UART1_CTL_R |= UART_CTL_RXE | UART_CTL_TXE | UART_CTL_UARTEN;
 
     GPIO_PORTC_AFSEL_R |= U1Rx | U1Tx;
     GPIO_PORTC_DR8R_R = U1Tx;  // 8 mA drive strength
 	GPIO_PORTC_DEN_R = U1Rx | U1Tx;
     GPIO_PORTC_PCTL_R |= 0x220000; // pins 4 and 5
     GPIO_PORTC_AMSEL_R &= ~(U1Rx | U1Tx);
+}
 
-    // if (UART1_FR_R & UART_FR_RXFE) recv(UART1_DR_R & 0xFF);
+inline bool rxRdy(void) {
+  return !UART1_FR_R & UART_FR_RXFE;  // Rx FIFO not empty
+}
+
+
+inline unsigned char rxChar(void) {
+	return UART1_DR_R;
+}
+
+inline void txWait(void) {
+  while (UART1_FR_R & UART_FR_TXFF);  // wait for Tx FIFO room
 }
 
 inline void sendByte(unsigned char c) {
-	UART1_DR_R = c;
+  UART1_DR_R = c;
 }
 
 void sendStr(char* str) {
 	while (*str) {
-	   while (UART1_FR_R & UART_FR_TXFF); // room in Tx FIFO
+	   txWait();
  	   sendByte(*str++);
 	}
 }
-
 
 
 void initGPIO() {
@@ -204,16 +210,17 @@ void initTimer(void) {
 
 const int DiscRPM = 300; // min - sonme are 360 RPM
 
-const int RevClocks = SysClock / (DiscRPM / 60) * 1015 / 1000;  // 1.5% speed error
-const int PastIndex = RevClocks * 12 / 16;
+const int RevClocks = SysClock / (DiscRPM / 60) * 1015 / 1000;  // includes +1.5% max speed error
+const int PastIndex = RevClocks * 12 / 16; // time to look for necxt index hole
 
 const int SlowBitClocks = 2 * SysClock / 1000000;  // 2, 3, 4 X 2 us
 const int HistogramSize = SlowBitClocks * 6;  // max
 int histogram[HistogramSize]; // 960
 
-// 80 MHz 2/3/4 us 360 RPM
-// set using 'A'djust command
-int BitClocks = SlowBitClocks;
+
+// MFM bit time interval thresholds
+// can set using 'A'djust command
+int BitClocks = SlowBitClocks; // 300 RPM  2/3/4 us
 
 int bitTime1p5 = BitClocks * 3 / 2;
 int bitTime2p5 = BitClocks * 5 / 2;
@@ -309,52 +316,54 @@ int main(void) {
     initUART1();
     initTimer();
 
-    while (!(UART1_FR_R & UART_FR_RXFE))
-      volatile int flush = UART1_DR_R;
+    while (rxRdy())
+      volatile int flush = rxChar();
 
 	while (1) {
-	  GPIO_PORTF_DATA_R = (GPIO_PORTD_DATA_BITS_R[Index | Track00] << 1 | GPIO_PORTD_DATA_BITS_R[DiskChange]) ^ 0xE;
+	  GPIO_PORTF_DATA_R = (GPIO_PORTD_DATA_BITS_R[Index | Track00] << 1 | GPIO_PORTD_DATA_BITS_R[DiskChange]) ^ 0xE; // update status LEDs
 
-	  if (!(UART1_FR_R & UART_FR_RXFE)) switch(UART1_DR_R & 0x5F) {
-	     case 'B' : step(true); break; // Back
-	     case 'S' : step(); break; // twice on high density drives
-	     case 'Z' :
+	  if (rxRdy()) switch(rxChar() & 0x5F) { // command character received
+	     case 'A' :  // Adjust bit timing
+	    	 delay_ms(16); // Rx FIFO should have all 4 values -- better a check header
+	    	 unsigned char* p = (unsigned char*)&bitTime1p5;
+	    	 for (int count = 4 * sizeof(int); count--;)
+	    		*p++ = UART1_DR_R;
+	    	 break;
+
+	     case 'B' : step(true); break; // step Back
+	     case 'S' : step(); break; // Step: twice on high density drives
+	     case 'Z' : // retract to track Zero
 	    	 int maxSteps = 80; // for hi density drives
 	    	 while (GPIO_PORTD_DATA_BITS_R[Track00] && maxSteps-- >= 0) step(true); // to track Zero
 	    	 break;
 
 	     case 'R' : readTrack(); break;
-	     case 'T' : readTrack(1); break; // side 1
-	     case 'H' :
-	    	 unsigned char* p = (unsigned char*)&histogram;
+	     case 'T' : readTrack(1); break; // read side 1
+	     case 'D' : readTrack(0, 1); break; // HiDensity
+
+	     case 'H' : // sned Histogram data
 	    	 histogram[0] = 0xBE66A7ED; // marker
-	    	 for (int i = 0; i < sizeof(histogram); i++) {
-	    	   while (UART1_FR_R & UART_FR_TXFF); // wait for room in Tx FIFO
+	    	 p = (unsigned char*)&histogram;
+	    	 for (int i = sizeof(histogram); i--;) {
+	    	   txWait();
 	    	   sendByte(*p);
 	    	   *p++ = 0;
 	         }
 	         break;
 
-	     case 'A' :  // adjust bit timing
-	    	 delay_ms(16); // Rx FIFO should have all 4 values
-	    	 p = (unsigned char*)&bitTime1p5;
-	    	 for (int count = 4 * sizeof(int); count--;)
-	    		*p++ = UART1_DR_R;
-	    	 break;
+	     case 'I' : sendStr("FDD MFM reader " __DATE__ " " __TIME__ "\n"); break; // Identify
 
-	     case 'M' :
+	     case 'M' : // Motor on
 	    	 motorTimeout = WTIMER3_TAV_R + SysClock; // 1 second
 	         motor();
 	         break;
 
-	     case 'I' : sendStr("FDD MFM reader " __DATE__ " " __TIME__ "\n"); break;
-
-	     case 'D' : readTrack(0, 1); break; // HiDensity
+	     case 'Q' : sendByte(GPIO_PORTD_DATA_BITS_R[Index | Track00 | DiskChange]); break; // status
 	  }
 
-	  if (!GPIO_PORTE_DATA_BITS_R[MotorOff] && (int)(WTIMER3_TAV_R - motorTimeout) > 0) {
+	  if (!GPIO_PORTE_DATA_BITS_R[MotorOff] && (int)(WTIMER3_TAV_R - motorTimeout) > 0) { // timeout
 		  motor(false);
-		  GPIO_PORTE_DATA_BITS_R[Side0 | HiDensity] = 0xFF;  // keep current low
+		  GPIO_PORTE_DATA_BITS_R[Side0 | HiDensity] = 0xFF; // Hi to keep pin currents low
 	  }
 
 	  if (!GPIO_PORTF_DATA_BITS_R[SW1]) { // SW1 pressed

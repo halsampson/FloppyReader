@@ -9,16 +9,8 @@
 void showError(void) {
   DWORD errCode = GetLastError();
   LPVOID lpMsgBuf;
-  FormatMessage(
-    FORMAT_MESSAGE_ALLOCATE_BUFFER |
-    FORMAT_MESSAGE_FROM_SYSTEM |
-    FORMAT_MESSAGE_IGNORE_INSERTS,
-    NULL,
-    errCode,
-    MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
-    (LPTSTR)&lpMsgBuf,
-    0, NULL);
-
+  FormatMessage(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+    NULL, errCode, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), (LPTSTR)&lpMsgBuf,  0, NULL);
   printf(": %s\n", (char*)lpMsgBuf);
   LocalFree(lpMsgBuf);
 }
@@ -72,7 +64,7 @@ HANDLE openSerial(const char* portName) {
   return hCom;
 }
 
-int rxRdy(void) {
+int rxRdy(void) { // returns # of characters in read buffer
   COMSTAT cs;
   DWORD commErrors;
   if (!ClearCommError(hCom, &commErrors, &cs)) return -1;
@@ -81,11 +73,16 @@ int rxRdy(void) {
   return cs.cbInQue;
 }
 
+void sendCmd(char ch) {
+  WriteFile(hCom, &ch, 1, NULL, NULL);
+}
+
+
 HWND consoleWnd;
 HDC console;
-int x, maxX, yOfs;
+int maxX, yOfs;
 
-void consoleGraph() {
+void consoleGraphInit() {
   char consoleWindowTitle[128];
   GetConsoleTitle(consoleWindowTitle, sizeof(consoleWindowTitle));
   consoleWnd = FindWindow(NULL, consoleWindowTitle);
@@ -96,84 +93,95 @@ void consoleGraph() {
   yOfs = rect.bottom - 1;
 }
 
+int x;
+
 void plot(int y) {
   SetPixel(console, x, yOfs - y, RGB(0, 255, 0));
   if (++x >= maxX) x = 0;
 }
 
-void sendCmd(char ch) {
-  WriteFile(hCom, &ch, 1, NULL, NULL);
-}
 
+UINT16 crc_ccitt[256]; // x**16+x**12+x**5+1 crc16 table
+const UINT16 CrcPreset = 0xFFFF; // preset to all 1's
 
-// x**16+x**12+x**5+1, with the initial sum preset to all 1's
-
-UINT16 crc_ccitt[256]; // crc16 table
-
-void crc16_init() { // crc16 init table
-  static bool inited = false;
-  if (inited)
-    return;
-
+void crc16_init() { // init crc16 table
   for (int i = 0; i < 256; i++) {
     UINT16 w = i << 8;
     for (int j = 0; j < 8; j++)
       w = (w << 1) ^ ((w & 0x8000) ? 0x1021 : 0);
     crc_ccitt[i] = w;
   }
-  inited = true;
 }
-
 
 inline UINT16 crc16(UINT16 crc, UINT8 b) { // calc crc16 for 1 byte
-  crc = (crc << 8) ^ crc_ccitt[((crc >> 8) & 0xff) ^ b];
+  return crc = (crc << 8) ^ crc_ccitt[((crc >> 8) & 0xff) ^ b];
+}
+
+UINT16 crc16_block(UINT8* ptr, size_t len, UINT16 crc = CrcPreset) { // calc crc16 for block
+  while (len--) crc = crc16(crc, *ptr++);
   return crc;
 }
 
-UINT16 crc16_block(UINT8* ptr, UINT16 len, UINT16 crc) { // calc crc16 for block
-  while (len--)
-    crc = crc16(crc, *ptr++);
-  return crc;
+
+void identify() {
+  sendCmd('I');
+  char id[64] = { 0 };
+  if (ReadFile(hCom, id, sizeof(id), NULL, NULL))
+    printf("%s\n", id);
+}
+
+// 80 MHz bit timing clocks * 2, 3, or 4 
+//const int BitClocks = 80 * 1;      // 1us    360 RPM high density
+//const int BitClocks = 80 * 5 / 3;  // 1.67us 360 RPM normal density
+const int BitClocks = 80 * 2;      // 2us    300 RPM normal density
+
+int bitTime1p5 = BitClocks * 3 / 2;
+int bitTime2p5 = BitClocks * 5 / 2;
+int bitTime3p5 = BitClocks * 7 / 2;
+int bitTime4p5 = BitClocks * 9 / 2;
+
+void adjustTiming(void) {
+  sendCmd('A');
+  WriteFile(hCom, &bitTime1p5, 3 * sizeof(int), NULL, NULL);
 }
 
 
-UINT8 mfm[32768];
-DWORD mfmBytes;
+UINT8 mfm[32768]; // clock/data/clock/data/... raw bits
+DWORD mfmTrackBytes;
 
-int bytePos, bitPos;
+int mfmBytePos, mfmBitPos;
 
-int getBit() {
-  if (--bitPos < 0) {
-    bitPos = 7;
-    ++bytePos;
+int getMfmBit() {
+  if (--mfmBitPos < 0) {
+    mfmBitPos = 7;
+    ++mfmBytePos;
   }
-  return (mfm[bytePos] >> bitPos) & 1;
+  return (mfm[mfmBytePos] >> mfmBitPos) & 1;
 }
 
 struct {
   UINT8  synch[12];
   UINT32 IDAM; // ID Address Mark 0xA1A1A1FE
-  UINT8 track;
-  UINT8 side;
-  UINT8 sector;
-  UINT8 sectorSizeID;  // 128 << N
+  UINT8  track;
+  UINT8  side;
+  UINT8  sector;
+  UINT8  sectorSizeID;  // 128 << N
   UINT16 headerCRC;
-  UINT8 n4E[22];  
-  UINT8 n00[12];
+  UINT8  n4E[22];  
+  UINT8  n00[12];
   UINT32 DAM;  // Data Address Mark 0xA1A1A1FB
-  UINT8 data[512]; // varies
+  UINT8  data[512]; // varies
   UINT16 dataCRC;
-  UINT8 fill[54];  // 4E
+  UINT8  fill[54];  // 4E
 } sector;
 
-
-FILE* fImg;
+FILE* fDiscImage;
 
 int decodeMFMtrack() {  // returns errorCount
   int errorCount = 0;
 
-  bytePos = 0; // could skip 130+ bytes header
-  bitPos = 0;
+  mfmBytePos = 0; // could skip 130+ bytes header
+  mfmBitPos = 0;
 
   int data = 0;
   int dataMFMbits = 0;
@@ -184,9 +192,9 @@ int decodeMFMtrack() {  // returns errorCount
 
   ULONG64 mfmBits = 0;
 
-  while (bytePos < (int)mfmBytes) {
+  while (mfmBytePos < (int)mfmTrackBytes) {
     mfmBits <<= 1;
-    int mfmBit = getBit();
+    int mfmBit = getMfmBit();
     mfmBits |= mfmBit;
 
     if (mfmBits == 0x4489448944895554) { // IDAM  A1 A1 A1 FE with missing clocks
@@ -201,8 +209,6 @@ int decodeMFMtrack() {  // returns errorCount
       dataBits = -1;
     }
 
-    // could check n00s
-
     if (pSector && dataMFMbits++ & 1) {
       data <<= 1;
       data |= mfmBit;
@@ -212,6 +218,8 @@ int decodeMFMtrack() {  // returns errorCount
 
     int sectorLen = min(128 << sector.sectorSizeID, 512);
 
+    // could check n00s, header CRC
+
     if (pSector > &sector.data[sectorLen] + sizeof(sector.dataCRC)) {
       pSector = NULL;
       static int lastSide = -1, lastTrack = -1;
@@ -220,7 +228,7 @@ int decodeMFMtrack() {  // returns errorCount
       if (sector.sector == 1) printf("Len %3d Sectors %d ", sectorLen, 1);
       else  printf("%d ", sector.sector);
 
-      UINT16 dCRC = crc16_block((UINT8*)&sector.DAM, sizeof(sector.DAM) + sectorLen, 0xFFFF);
+      UINT16 dCRC = crc16_block((UINT8*)&sector.DAM, sizeof(sector.DAM) + sectorLen);
       dCRC = _byteswap_ushort(dCRC);
       if (dCRC != sector.dataCRC) {
         if (sector.side > 1 || sector.track > 39 || sector.sector > 9 || sectorLen != 512) {
@@ -231,7 +239,7 @@ int decodeMFMtrack() {  // returns errorCount
         ++errorCount;
       }
 
-      if (fImg) fwrite(sector.data, 1, sectorLen, fImg);
+      if (fDiscImage) fwrite(sector.data, 1, sectorLen, fDiscImage);
 
       if (sector.sector == 9) return errorCount;  // don't scan through garbage (could check BPB)
     }
@@ -239,40 +247,29 @@ int decodeMFMtrack() {  // returns errorCount
   return errorCount;
 }
 
-int getData(void) {
-  mfmBytes = 0;
+int getTrackData(void) {
+  mfmTrackBytes = 0;
   do {
     DWORD gotBytes = 0;
-    ReadFile(hCom, mfm + mfmBytes, sizeof(mfm), &gotBytes, NULL);
-    mfmBytes += gotBytes;
+    if (!ReadFile(hCom, mfm + mfmTrackBytes, sizeof(mfm), &gotBytes, NULL)) break;
+    mfmTrackBytes += gotBytes;
     Sleep(700);
   } while (rxRdy());
 
-  if (mfmBytes < 7000) printf("Got %d, status %c\n", mfmBytes, mfm[0]);
-
+  if (mfmTrackBytes < 7000) printf("Got %d, status %c\n", mfmTrackBytes, mfmTrackBytes ? mfm[0] : '0');
   // TODO: if get 0 bytes then retry
+
   return decodeMFMtrack(); // error count
 }
 
-
-// 80 MHz bit timing clocks * 2, 3, or 4 
-//const int BitClocks = 80 * 1;      // 1us    360 RPM high density
-//const int BitClocks = 80 * 5 / 3;  // 1.67us 360 RPM normal density
-const int BitClocks = 80 * 2;      // 2us    300 RPM normal density
-
-int bitTime1p5 = BitClocks * 3 / 2;
-int bitTime2p5 = BitClocks * 5 / 2;
-int bitTime3p5 = BitClocks * 7 / 2;
-int bitTime4p5 = BitClocks * 9 / 2;
-
-unsigned int hist[80 * 2 * 6];
+unsigned int histogram[80 * 2 * 6];
 
 void plotHistogram() {
   sendCmd('H');
   DWORD gotBytes;
-  ReadFile(hCom, hist, sizeof(hist), &gotBytes, NULL);
+  if (!ReadFile(hCom, histogram, sizeof(histogram), &gotBytes, NULL)) return;
 
-  if (hist[0] != 0xBE66A7ED) {
+  if (histogram[0] != 0xBE66A7ED) { // marker
     printf("Synch err\n");
     return; // or scan and shift buffer
   }
@@ -281,33 +278,17 @@ void plotHistogram() {
   for (DWORD x = 1; x < gotBytes / sizeof(int); x++) {
     if (x == bitTime1p5 || x == bitTime2p5 || x == bitTime3p5) { // time threshold markers
       int y = 64;
-      while (y--)
-        SetPixel(console, x, yOfs - y, RGB(255, 255, 0));
+      while (y--) SetPixel(console, x, yOfs - y, RGB(255, 255, 0));
     }
-    plot((int)(log((double)(hist[x] + 1)) * 20));
+    plot((int)(log((double)histogram[x] + 1) * 20));
   }
-}
-
-void adjustTiming(void) {
-  WriteFile(hCom, &bitTime1p5, 3 * sizeof(int), NULL, NULL);
-}
-
-
-void identify() {
-  sendCmd('I');
-  char id[64] = { 0 };
-  ReadFile(hCom, id, sizeof(id), NULL, NULL);
-  printf("%s\n", id);
 }
 
 int main() {
   openSerial("COM10");
-
   identify();
-
   adjustTiming(); // TODO: dynamic based on histogram
-
-  consoleGraph();
+  consoleGraphInit();
   crc16_init();
 
   char imgFileName[] = "floppy.A.img";
@@ -323,25 +304,24 @@ int main() {
         break;
 
       case 'F' : // copy to .IMG File
-        if (fopen_s(&fImg, imgFileName, "wb")) {
+        if (fopen_s(&fDiscImage, imgFileName, "wb")) {
           printf("Can't open %s\n", imgFileName);
           break;
         }
         ++imgFileName[7];
-        sendCmd('S');
-        sendCmd('Z');  Sleep(40 * 5);
+        sendCmd('Z');  Sleep(40 * 5); // seek to track 00
         for (int track = 0; track < 40; track++) {
           for (int side = 0; side <= 1; side++) {
             if (side) sendCmd('T'); else sendCmd('R');
             if (track == 0 && side == 0) Sleep(500); // motor spin up
-            int errors = getData();
+            int errors = getTrackData();
             plotHistogram();
             if (_kbhit()) break;            
           }
-          sendCmd('S');
+          sendCmd('S'); // Step
           if (_kbhit()) break;
         }
-        if (fImg) {fclose(fImg); fImg = 0;}
+        if (fDiscImage) {fclose(fDiscImage); fDiscImage = 0;}
         break;
 
       case 'H': plotHistogram(); break;
@@ -351,7 +331,7 @@ int main() {
         sendCmd(cmd); 
         if (cmd == 'R' || cmd == 'T' || cmd == 'D') {
           Sleep(500); // motor spin up
-          getData();
+          getTrackData();
           plotHistogram();
           sendCmd('S');
         }
