@@ -233,10 +233,12 @@ void readTrack(int side = 0, int density = 0) {
 
 	int indexTimeout = (int)WTIMER3_TAV_R + 60 * RevClocks;
 	while (!(GPIO_PORTD_DATA_BITS_R[Index])) { //wait for no index hole
+#if 0
 	  if ((int)WTIMER3_TAV_R - indexTimeout > 0) {
 		sendByte('H');  // status: stuck at index Hole
 		return;
 	  }
+#endif
 	}
 	while (GPIO_PORTD_DATA_BITS_R[Index]) { //wait for index hole
 #if 0

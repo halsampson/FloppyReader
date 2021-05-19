@@ -63,9 +63,9 @@ HANDLE openSerial(const char* portName) {
   // USB bulk packets arrive at 1 kHz rate
   COMMTIMEOUTS timeouts = { 0 };  // in ms
 
-  const int DiscRPM = 300; // min
+  const int DiscRPM = 300 - 5; // min
   timeouts.ReadIntervalTimeout = 50 + 2 * 60 * 1000 / DiscRPM + 100; // wait for index + 1 rev
-  timeouts.ReadTotalTimeoutConstant = timeouts.ReadIntervalTimeout + 100;
+  timeouts.ReadTotalTimeoutConstant = timeouts.ReadIntervalTimeout + 300;
   timeouts.ReadTotalTimeoutMultiplier = 0;
   if (!SetCommTimeouts(hCom, &timeouts))  printf("Can't SetCommTimeouts");
 
@@ -245,7 +245,7 @@ int getData(void) {
     DWORD gotBytes = 0;
     ReadFile(hCom, mfm + mfmBytes, sizeof(mfm), &gotBytes, NULL);
     mfmBytes += gotBytes;
-    Sleep(300);
+    Sleep(700);
   } while (rxRdy());
 
   if (mfmBytes < 7000) printf("Got %d, status %c\n", mfmBytes, mfm[0]);
