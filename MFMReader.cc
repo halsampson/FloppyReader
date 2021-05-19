@@ -8,7 +8,12 @@
 #include "inc/hw_types.h"
 #include "driverlib/sysctl.h"
 
-const int BaudRate = 921600;
+
+// High density floppy can generate transitions every < 1us, taking 2 bits to send timing interval
+// so BaudRate should be 2 * 10 / 8  > 2.5 MBit
+// FTDI supports 3 Mbit
+
+const int BaudRate = 3000000;
 
 /*
 PB0 3.6V max
@@ -48,7 +53,7 @@ const int GRN = 1 << 3;  // DiskChange
 const int SW1 = 1 << 4;
 
 
-const int SysClock = 80 * 1000 * 1000; // max allowed  by MINSYSDIV using PLL
+const long long SysClock = 80 * 1000 * 1000; // max allowed  by MINSYSDIV using PLL
 
 void initUART0(void) {
 	SYSCTL_RCGC1_R |= SYSCTL_RCGC1_UART0;
@@ -61,7 +66,7 @@ void initUART0(void) {
 
 	int baud = BaudRate;
 	if (baud * 16 > SysClock) {
-		UART0_CTL_R |= UART_CTL_HSE;
+		UART0_CTL_R |= UART_CTL_HSE; // 8 * BaudRate
 		baud /= 2;
 	} else UART0_CTL_R &= ~UART_CTL_HSE;
 	int baudX64 = (SysClock * 8 / baud + 1) / 2;
@@ -69,9 +74,10 @@ void initUART0(void) {
 	UART0_FBRD_R = baudX64 % 64;
 	UART0_LCRH_R = UART_LCRH_WLEN_8 | UART_LCRH_FEN;
 	UART0_CC_R = 0;  // SysClock default
-	UART0_CTL_R |= UART_CTL_RXE | UART_CTL_TXE | UART_CTL_UARTEN; //  | UART_CTL_HSE for / 8
+	UART0_CTL_R |= UART_CTL_RXE | UART_CTL_TXE | UART_CTL_UARTEN;
 
     GPIO_PORTA_AFSEL_R |= U0Rx | U0Tx;
+    GPIO_PORTA_DR8R_R = U0Tx; // 8 mA drive strength
 	GPIO_PORTA_DEN_R = U0Rx | U0Tx;
     GPIO_PORTA_PCTL_R |= 0x11;  // pins 0 and 1 default
     GPIO_PORTA_AMSEL_R &= ~(U0Rx | U0Tx);
@@ -97,11 +103,12 @@ void initUART1(void) {
 	int baudX64 = (SysClock * 8 / baud + 1) / 2;
 	UART1_IBRD_R = baudX64 / 64;
 	UART1_FBRD_R = baudX64 % 64;
-	UART1_LCRH_R = UART_LCRH_WLEN_8 | UART_LCRH_FEN;
+	UART1_LCRH_R = UART_LCRH_WLEN_8 | UART_LCRH_FEN; //  FIFO doesn't help long string of 0s or 1s much
 	UART1_CC_R = 0;  // SysClock default
 	UART1_CTL_R |= UART_CTL_RXE | UART_CTL_TXE | UART_CTL_UARTEN; //  | UART_CTL_HSE for / 8
 
     GPIO_PORTC_AFSEL_R |= U1Rx | U1Tx;
+    GPIO_PORTC_DR8R_R = U1Tx;  // 8 mA drive strength
 	GPIO_PORTC_DEN_R = U1Rx | U1Tx;
     GPIO_PORTC_PCTL_R |= 0x220000; // pins 4 and 5
     GPIO_PORTC_AMSEL_R &= ~(U1Rx | U1Tx);
@@ -115,8 +122,7 @@ inline void sendByte(unsigned char c) {
 
 void sendStr(char* str) {
 	while (*str) {
-	   int timeout = 8 * SysClock * 10 / BaudRate;
-	   while (!(UART1_RIS_R & UART_RIS_TXRIS) && timeout-- > 0); // room in Tx FIFO
+	   while (UART1_FR_R & UART_FR_TXFF); // room in Tx FIFO
  	   sendByte(*str++);
 	}
 }
@@ -149,12 +155,12 @@ void initGPIO() {
 
 
 void delay_us(int us) {
-  long endCount = WTIMER3_TAV_R + us * (SysClock / 1000000) + 10;  // incl.overhead
+  long endCount = (long)WTIMER3_TAV_R + us * (SysClock / 1000000) + 10;  // incl. overhead
   while ((long)WTIMER3_TAV_R - endCount < 0);
 }
 
-void delay_ms(int ms) {
-  long endCount = WTIMER3_TAV_R + ms * (SysClock / 1000) + 10;  // incl.overhead
+void delay_ms(int ms) {  // up to 26.8 secs
+  long endCount = (long)WTIMER3_TAV_R + ms * (SysClock / 1000) + 10;  // incl. overhead
   while ((long)WTIMER3_TAV_R - endCount < 0);
 }
 
@@ -167,7 +173,7 @@ void step(bool out = false) {
   GPIO_PORTE_DATA_BITS_R[Step] = 0;
   delay_us(1);
   GPIO_PORTE_DATA_BITS_R[Step] = Step;
-  delay_ms(3);
+  delay_ms(10);
   GPIO_PORTE_DATA_BITS_R[Direction] = Direction;  // keep Hi vs. total current limit
 }
 
@@ -195,34 +201,54 @@ void initTimer(void) {
   // timer TAV_R should be counting; TAR_R captures edge times
 }
 
-const int TrackClocks = SysClock / (360 / 60);  // 360 RPM
-const int TrackEnd = TrackClocks * 15 / 16;
+const int DiscRPM = 300; // min - sonme are 360 RPM
 
-const int BitClocks = SysClock / 1000000 * 5 / 3;  // 1.67 us
-const int HistogramSize = BitClocks * 9 / 2;  // 4.5 bit times max   * 2 if slow
-int histogram[HistogramSize];
+const int RevClocks = SysClock / (DiscRPM / 60) * 1015 / 1000;  // 1.5% speed error
+const int PastIndex = RevClocks * 12 / 16;
 
-// 80 MHz 2/3/4 us
-int bitTime1p5 = 200 - 13;
-int bitTime2p5 = 333 + 13;
-int bitTime3p5 = 467 - 17;
+const int SlowBitClocks = 2 * SysClock / 1000000;  // 2, 3, 4 X 2 us
+const int HistogramSize = SlowBitClocks * 6;  // max
+int histogram[HistogramSize]; // 960
+
+// 80 MHz 2/3/4 us 360 RPM
+// set using 'A'djust command
+int BitClocks = SlowBitClocks;
+
+int bitTime1p5 = BitClocks * 3 / 2;
+int bitTime2p5 = BitClocks * 5 / 2;
+int bitTime3p5 = BitClocks * 7 / 2;
+int bitTime4p5 = BitClocks * 9 / 2;
 
 void readTrack(int side = 0, int density = 0) {
 	GPIO_PORTE_DATA_BITS_R[HiDensity] = density ? 0 : HiDensity;  // also 2 steps for 48 tpi
-	GPIO_PORTE_DATA_BITS_R[Side0] = side ? 0 : Side0;
+	GPIO_PORTE_DATA_BITS_R[Side0] = side ? 0 : Side0;  // Lo = Side1 select
 
 	if (GPIO_PORTE_DATA_BITS_R[MotorOff]) {
 	  motor();
 	  delay_ms(500); // wait until up to speed
 	}
-	motorTimeout = (int)WTIMER3_TAV_R + SysClock;
+	motorTimeout = (int)WTIMER3_TAV_R + SysClock; // 1 second
 
-	while (GPIO_PORTD_DATA_BITS_R[Index]); //wait for index hole
+	int indexTimeout = (int)WTIMER3_TAV_R + 60 * RevClocks;
+	while (!(GPIO_PORTD_DATA_BITS_R[Index])) { //wait for no index hole
+	  if ((int)WTIMER3_TAV_R - indexTimeout > 0) {
+		sendByte('H');  // status: stuck at index Hole
+		return;
+	  }
+	}
+	while (GPIO_PORTD_DATA_BITS_R[Index]) { //wait for index hole
+#if 0
+	  if ((int)WTIMER3_TAV_R - indexTimeout > 0) {
+		sendByte('I'); // status: no Index -- WHY??
+		return;
+	  }
+#endif
+	 }
 
+
+	int revPastIndex = (int)WTIMER3_TAV_R + PastIndex;
+	int noDataEnd = (int)WTIMER3_TAV_R + 2 * RevClocks;
 	int prevEdgeTime = (int)WTIMER3_TAR_R;
-	int start = WTIMER3_TAV_R;
-	int trackEnd = start + TrackEnd;
-	int noDataEnd = start + SysClock / 2; // 500 ms timeout
 
 	int mfmBits = 1;
 	int mfmPos = 1;  // clock then data
@@ -230,10 +256,13 @@ void readTrack(int side = 0, int density = 0) {
 
 	while (1) {
 	  while (!(WTIMER3_RIS_R & TIMER_RIS_CAERIS))  { // wait for neg edge capture vs. interrupt?
-		if ((int)WTIMER3_TAV_R - trackEnd > 0) {
-	   	  if (!GPIO_PORTD_DATA_BITS_R[Index]
-		  || (int)WTIMER3_TAV_R - noDataEnd > 0 // prevent stuck if no data
-		  ) return;
+		if ((int)WTIMER3_TAV_R - revPastIndex > 0) {
+	   	  if (!GPIO_PORTD_DATA_BITS_R[Index]) // index hole at end of track
+	   		  return; // done with track
+          if ((int)WTIMER3_TAV_R - noDataEnd > 0) { // prevent stuck if no data
+        	sendByte('D'); // no Data
+		    return;
+          }
 		}
 	  }
 
@@ -259,7 +288,9 @@ void readTrack(int side = 0, int density = 0) {
 		bitCount = 2;
 	  else if (bitInterval < bitTime3p5)
 		bitCount = 3;
-	  else bitCount = 4;
+	  else if (bitInterval < bitTime4p5)
+		bitCount = 4;
+	  else continue; // not in synch
 
 	  mfmBits <<= bitCount;
 	  mfmBits |= 1;
@@ -280,42 +311,49 @@ int main(void) {
     initTimer();
 
     while (!(UART1_FR_R & UART_FR_RXFE))
-    	UART1_DR_R = UART1_DR_R; // flush
+      volatile int flush = UART1_DR_R;
 
 	while (1) {
 	  GPIO_PORTF_DATA_R = (GPIO_PORTD_DATA_BITS_R[Index | Track00] << 1 | GPIO_PORTD_DATA_BITS_R[DiskChange]) ^ 0xE;
 
 	  if (!(UART1_FR_R & UART_FR_RXFE)) switch(UART1_DR_R & 0x5F) {
-	     case 'B' : step(true); step(true); break; // Back
-	     case 'S' : step(); step(); break;
-	     case 'Q' : step(); break;  // 96 tpi only
-	     case 'Z' : while (GPIO_PORTD_DATA_BITS_R[Track00]) step(true); break;  // to track Zero
+	     case 'B' : step(true); break; // Back
+	     case 'S' : step(); break; // twice on high density drives
+	     case 'Z' :
+	    	 int maxSteps = 80; // for hi density drives
+	    	 while (GPIO_PORTD_DATA_BITS_R[Track00] && maxSteps-- >= 0) step(true); // to track Zero
+	    	 break;
 
 	     case 'R' : readTrack(); break;
 	     case 'T' : readTrack(1); break; // side 1
 	     case 'H' :
 	    	 unsigned char* p = (unsigned char*)&histogram;
+	    	 histogram[0] = 0xBE66A7ED; // marker
 	    	 for (int i = 0; i < sizeof(histogram); i++) {
-	    	   int timeout = 8 * SysClock * 10 / BaudRate;
-	    	   while (!(UART1_RIS_R & UART_RIS_TXRIS) && timeout-- > 0); // wait for 8 bytes room in Tx FIFO
+	    	   while (UART1_FR_R & UART_FR_TXFF); // wait for room in Tx FIFO
 	    	   sendByte(*p);
 	    	   *p++ = 0;
 	         }
 	         break;
 
-	     case 'A' :  // adjust timing
-	    	 delay_ms(16); // Rx FIFO should have values
+	     case 'A' :  // adjust bit timing
+	    	 delay_ms(16); // Rx FIFO should have all 4 values
 	    	 p = (unsigned char*)&bitTime1p5;
-	    	 for (int count = 3 * sizeof(int); count--;)
+	    	 for (int count = 4 * sizeof(int); count--;)
 	    		*p++ = UART1_DR_R;
 	    	 break;
+
+	     case 'M' :
+	    	 motorTimeout = (int)WTIMER3_TAV_R + SysClock; // 1 second
+	         motor();
+	         break;
 
 	     case 'I' : sendStr("FDD MFM reader " __DATE__ " " __TIME__ "\n"); break;
 
 	     case 'D' : readTrack(0, 1); break; // HiDensity
 	  }
 
-	  if (!GPIO_PORTE_DATA_BITS_R[MotorOff] && (WTIMER3_TAV_R - motorTimeout) > 0) {
+	  if (!GPIO_PORTE_DATA_BITS_R[MotorOff] && ((int)WTIMER3_TAV_R - motorTimeout) > 0) {
 		  motor(false);
 		  GPIO_PORTE_DATA_BITS_R[Side0 | HiDensity] = 0xFF;  // keep current low
 	  }

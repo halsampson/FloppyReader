@@ -25,6 +25,9 @@ void showError(void) {
 
 HANDLE hCom;
 
+// TODO: compare with PuTTY code which somehow sets 3M baud OK
+//    perhaps also to bridge drivers directly???
+
 HANDLE openSerial(const char* portName) {
   char portDev[16] = "\\\\.\\";
   strcat_s(portDev, sizeof(portDev), portName);
@@ -35,17 +38,23 @@ HANDLE openSerial(const char* portName) {
 #if 1 // configure far end bridge COM port - only for bridges - could check endpoint capabilites??
   DCB dcb = { 0 };
   dcb.DCBlength = sizeof(DCB);
-  dcb.BaudRate = 921600; // 2000000; //  115200;
+  dcb.BaudRate = 3000000;
   // PL2303HX:  Divisor = 12 * 1000 * 1000 * 32 / baud --> 12M, 6M, 3M, 2457600, 1228800, 921600, ... baud
   // FTDI 3 MHz / (n + 0, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875; where n is an integer between 2 and 16384)
   // Note: special cases n = 0 -> 3 MBaud; n = 1 -> 2 MBaud; Sub-integer divisors between 0 and 2 not allowed.
+  // CP2102: Use configuration utility to set aliases: 2M, 3M, and higher supported
   dcb.ByteSize = 8;
   dcb.StopBits = 1;
   dcb.fBinary = TRUE; // no EOF check
+  dcb.fDtrControl = DTR_CONTROL_ENABLE;
+  dcb.fRtsControl = RTS_CONTROL_ENABLE;
+
+  dcb.XonChar = 17;
+  dcb.XoffChar = 19; // error if same as XonChar
 #endif  
 
   if (!SetCommState(hCom, &dcb)) {
-    printf("Can't set baud");
+    printf("Can't set baud - use PuTTY"); 
     showError();
   }
 
@@ -53,8 +62,10 @@ HANDLE openSerial(const char* portName) {
 
   // USB bulk packets arrive at 1 kHz rate
   COMMTIMEOUTS timeouts = { 0 };  // in ms
-  timeouts.ReadIntervalTimeout = 500 + 167 * 2;
-  timeouts.ReadTotalTimeoutConstant = 500 + 167 * 2; // spin up + index
+
+  const int DiscRPM = 300; // min
+  timeouts.ReadIntervalTimeout = 50 + 2 * 60 * 1000 / DiscRPM + 100; // wait for index + 1 rev
+  timeouts.ReadTotalTimeoutConstant = timeouts.ReadIntervalTimeout + 100;
   timeouts.ReadTotalTimeoutMultiplier = 0;
   if (!SetCommTimeouts(hCom, &timeouts))  printf("Can't SetCommTimeouts");
 
@@ -223,42 +234,51 @@ int decodeMFMtrack() {  // returns errorCount
 }
 
 int getData(void) {
-  ReadFile(hCom, mfm, sizeof(mfm), &mfmBytes, NULL);
-  if (mfmBytes < 8000) printf("Got %d ", mfmBytes);
+  mfmBytes = 0;
+  do {
+    DWORD gotBytes = 0;
+    ReadFile(hCom, mfm + mfmBytes, sizeof(mfm), &gotBytes, NULL);
+    mfmBytes += gotBytes;
+    Sleep(300);
+  } while (rxRdy());
+
+  if (mfmBytes < 7000) printf("Got %d, status %c\n", mfmBytes, mfm[0]);
+
+  // TODO: if get 0 bytes then retry
   return decodeMFMtrack(); // error count
 }
 
 
-// 80 MHz timing clock
+// 80 MHz bit timing clocks * 2, 3, or 4 
+//const int BitClocks = 80 * 1;      // 1us    360 RPM high density
+//const int BitClocks = 80 * 5 / 3;  // 1.67us 360 RPM normal density
+const int BitClocks = 80 * 2;      // 2us    300 RPM normal density
 
-#if 1 // 55GFR 2/3/4 us
-  int bitTime1p5 = 200;
-  int bitTime2p5 = 333 + 6;
-  int bitTime3p5 = 467 - 20;
-#elif 1  // 1/1.5/2 us  High Density 1.2 MB
-  int bitTime2p5 = 200;
-  int bitTime3p5 = 280;
-#else // 55BV  4/6/8 us
-  int bitTime2p5 = 400;
-  int bitTime3p5 = bitTime2p5 * 35 / 25;
-#endif
+int bitTime1p5 = BitClocks * 3 / 2;
+int bitTime2p5 = BitClocks * 5 / 2;
+int bitTime3p5 = BitClocks * 7 / 2;
+int bitTime4p5 = BitClocks * 9 / 2;
 
-
-unsigned int hist[80 * 5 / 3 * 9 / 2];
+unsigned int hist[80 * 2 * 6];
 
 void plotHistogram() {
   sendCmd('H');
   DWORD gotBytes;
   ReadFile(hCom, hist, sizeof(hist), &gotBytes, NULL);
 
+  if (hist[0] != 0xBE66A7ED) {
+    printf("Synch err\n");
+    return; // or scan and shift buffer
+  }
+
   x = 0;
-  for (DWORD x = 0; x < gotBytes / sizeof(int); x++) {
+  for (DWORD x = 1; x < gotBytes / sizeof(int); x++) {
     if (x == bitTime1p5 || x == bitTime2p5 || x == bitTime3p5) { // time threshold markers
       int y = 64;
       while (y--)
         SetPixel(console, x, yOfs - y, RGB(255, 255, 0));
     }
-    plot((int)(logf(hist[x] + 1) * 20));
+    plot((int)(log((double)(hist[x] + 1)) * 20));
   }
 }
 
@@ -266,13 +286,18 @@ void adjustTiming(void) {
   WriteFile(hCom, &bitTime1p5, 3 * sizeof(int), NULL, NULL);
 }
 
-int main() {
-  openSerial("COM10");
 
+void identify() {
   sendCmd('I');
   char id[64] = { 0 };
   ReadFile(hCom, id, sizeof(id), NULL, NULL);
   printf("%s\n", id);
+}
+
+int main() {
+  openSerial("COM10");
+
+  identify();
 
   adjustTiming(); // TODO: dynamic based on histogram
 
@@ -285,7 +310,13 @@ int main() {
     while (!_kbhit());
     char cmd = toupper(_getch());
     switch (cmd) { 
-      case 'I' : // dump .IMG file
+      case 'C': // clear screen
+      case ' ':
+        InvalidateRect(consoleWnd, NULL, true);
+        system("CLS");
+        break;
+
+      case 'F' : // copy to .IMG File
         if (fopen_s(&fImg, imgFileName, "wb")) {
           printf("Can't open %s\n", imgFileName);
           break;
@@ -294,29 +325,26 @@ int main() {
         sendCmd('S');
         sendCmd('Z');  Sleep(40 * 5);
         for (int track = 0; track < 40; track++) {
-          sendCmd('R');          
-          if (track == 0) Sleep(500);
-          int errors = getData();
-          plotHistogram();
-          if (_kbhit()) break;
+          for (int side = 0; side <= 1; side++) {
+            if (side) sendCmd('T'); else sendCmd('R');
+            if (track == 0 && side == 0) Sleep(500); // motor spin up
+            int errors = getData();
+            plotHistogram();
+            if (_kbhit()) break;            
+          }
           sendCmd('S');
+          if (_kbhit()) break;
         }
         if (fImg) {fclose(fImg); fImg = 0;}
         break;
 
-      case 'H': 
-        plotHistogram(); 
-        break;
-
-      case ' ': 
-        InvalidateRect(consoleWnd, NULL, true); 
-        system("CLS");
-        break;
+      case 'H': plotHistogram(); break;
+      case 'I': identify(); break;
 
       default: 
         sendCmd(cmd); 
         if (cmd == 'R' || cmd == 'T' || cmd == 'D') {
-          Sleep(500);
+          Sleep(500); // motor spin up
           getData();
           plotHistogram();
           sendCmd('S');
