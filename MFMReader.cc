@@ -52,7 +52,7 @@ const int GRN = 1 << 3;  // DiskChange
 const int SW1 = 1 << 4;
 
 
-const long long SysClock = 80 * 1000 * 1000; // max allowed  by MINSYSDIV using PLL
+const unsigned int SysClock = 80 * 1000 * 1000; // max allowed  by MINSYSDIV using PLL
 
 void initUART0(void) {
 	SYSCTL_RCGC1_R |= SYSCTL_RCGC1_UART0;
@@ -115,7 +115,6 @@ inline bool rxRdy(void) {
   return !UART1_FR_R & UART_FR_RXFE;  // Rx FIFO not empty
 }
 
-
 inline unsigned char rxChar(void) {
 	return UART1_DR_R;
 }
@@ -162,13 +161,13 @@ void initGPIO() {
 
 
 void delay_us(int us) {
-  long endCount = (long)WTIMER3_TAV_R + us * (SysClock / 1000000) + 10;  // incl. overhead
-  while ((long)WTIMER3_TAV_R - endCount < 0);
+  unsigned int endCount = WTIMER3_TAV_R + us * (SysClock / 1000000) + 10;  // incl. overhead
+  while ((int)(WTIMER3_TAV_R - endCount) < 0);
 }
 
 void delay_ms(int ms) {  // up to 26.8 secs
-  long endCount = (long)WTIMER3_TAV_R + ms * (SysClock / 1000) + 10;  // incl. overhead
-  while ((long)WTIMER3_TAV_R - endCount < 0);
+  unsigned int endCount = WTIMER3_TAV_R + ms * (SysClock / 1000) + 10;  // incl. overhead
+  while ((int)(WTIMER3_TAV_R - endCount) < 0);
 }
 
 void step(bool out = false) {
