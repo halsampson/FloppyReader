@@ -101,7 +101,7 @@ void plot(int y) {
 }
 
 
-UINT16 crc_ccitt[256]; // x**16+x**12+x**5+1 crc16 table
+UINT16 crc_ccitt[256]; // x**16 + x**12 + x**5 + 1 CRC16 table
 const UINT16 CrcPreset = 0xFFFF; // preset to all 1's
 
 void crc16_init() { // init crc16 table
@@ -114,7 +114,7 @@ void crc16_init() { // init crc16 table
 }
 
 inline UINT16 crc16(UINT16 crc, UINT8 b) { // calc crc16 for 1 byte
-  return crc = (crc << 8) ^ crc_ccitt[((crc >> 8) & 0xff) ^ b];
+  return crc = (crc << 8) ^ crc_ccitt[((crc >> 8) & 0xFF) ^ b];
 }
 
 UINT16 crc16_block(UINT8* ptr, size_t len, UINT16 crc = CrcPreset) { // calc crc16 for block

@@ -3,15 +3,13 @@
 // for TI LM4F120XL dev board
 // sends MFM data to FloppyReader.cpp
 
-
 #include "inc\lm4f120h5qr.h"
 #include "inc/hw_memmap.h"
 #include "inc/hw_types.h"
 #include "driverlib/sysctl.h"
 
-
 // High density floppy can generate transitions every < 1us, taking 2 bits to send timing interval
-// so BaudRate should be > 2 * 10 / 8  = 2.5 MBaud
+// so BaudRate should be > 2 * (1 + 8 + 1) / 8  = 2.5 MBaud
 const int BaudRate = 3000000;
 
 /* special pins to avoid
@@ -53,6 +51,19 @@ const int SW1 = 1 << 4;
 
 
 const unsigned int SysClock = 80 * 1000 * 1000; // max allowed  by MINSYSDIV using PLL
+
+void initCpuClock(unsigned int xtal = SYSCTL_XTAL_16MHZ) {
+	// power up main oscillator & PLL; continue to use PIOSC
+    SYSCTL_RCC_R = SYSCTL_RCC_R & ~(SYSCTL_RCC_OSCSRC_M | SYSCTL_RCC_XTAL_M | SYSCTL_RCC_PWRDN | SYSCTL_RCC_USESYSDIV) | SYSCTL_RCC_BYPASS | SYSCTL_RCC_OSCSRC_INT | xtal;
+    SYSCTL_RCC2_R = SYSCTL_RCC2_R & ~(SYSCTL_RCC2_OSCSRC2_M | SYSCTL_RCC2_PWRDN2) | SYSCTL_RCC2_USERCC2 | SYSCTL_RCC2_BYPASS2 | SYSCTL_RCC2_OSCSRC2_IO;
+
+    SYSCTL_MISC_R = SYSCTL_INT_PLL_LOCK; // Clear the PLL lock interrupt
+    SYSCTL_RCC_R &= ~SYSCTL_RCC_MOSCDIS;  // enable main osc
+    SYSCTL_RCC2_R = SYSCTL_RCC2_R & ~(SYSCTL_RCC2_SYSDIV2_M | SYSCTL_RCC2_OSCSRC2_M | SYSCTL_RCC2_SYSDIV2LSB) | SYSCTL_SYSDIV_2_5;
+    while (!(SYSCTL_RIS & SYSCTL_INT_PLL_LOCK)); // wait for PLL lock
+    SYSCTL_RCC2_R &= ~SYSCTL_RCC2_BYPASS2; // switch to PLL clock
+}
+
 
 void initUART0(void) {
 	SYSCTL_RCGC1_R |= SYSCTL_RCGC1_UART0;
@@ -309,14 +320,13 @@ void readTrack(int side = 0, int density = 0) {
 
 
 int main(void) {
-    SysCtlClockSet(SYSCTL_OSC_MAIN | SYSCTL_XTAL_16MHZ | SYSCTL_USE_PLL | SYSCTL_SYSDIV_2_5);  // 400 MHz PLL / 2 / 2.5 = 80 MHz
-      // MINSYSDIV limits any higher speed divisor (but can push PLL Hz using lower XTAL setting -- vs. USB)
+	initCpuClock();
 	initGPIO();
-    initUART1();
-    initTimer();
+  initUART1();
+  initTimer();
 
-    while (rxRdy())
-      volatile int flush = rxChar();
+  while (rxRdy())
+    volatile int flush = rxChar();
 
 	while (1) {
 	  GPIO_PORTF_DATA_R = (GPIO_PORTD_DATA_BITS_R[Index | Track00] << 1 | GPIO_PORTD_DATA_BITS_R[DiskChange]) ^ 0xE; // update status LEDs
