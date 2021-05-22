@@ -17,9 +17,6 @@ void showError(void) {
 
 HANDLE hCom;
 
-// TODO: compare with PuTTY code which somehow sets 3M baud OK
-//    perhaps also to bridge drivers directly???
-
 HANDLE openSerial(const char* portName) {
   char portDev[16] = "\\\\.\\";
   strcat_s(portDev, sizeof(portDev), portName);
@@ -36,7 +33,7 @@ HANDLE openSerial(const char* portName) {
   // Note: special cases n = 0 -> 3 MBaud; n = 1 -> 2 MBaud; Sub-integer divisors between 0 and 2 not allowed.
   // CP2102: Use configuration utility to set aliases: 2M, 3M, and higher supported
   dcb.ByteSize = 8;
-  dcb.StopBits = 1;
+  dcb.StopBits = 0;  // BUG in SetCommState ??
   dcb.fBinary = TRUE; // no EOF check
   dcb.fDtrControl = DTR_CONTROL_ENABLE;
   dcb.fRtsControl = RTS_CONTROL_ENABLE;

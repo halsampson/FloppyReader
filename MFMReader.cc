@@ -126,7 +126,7 @@ void initUART1(void) {
 }
 
 inline bool rxRdy(void) {
-  return !UART1_FR_R & UART_FR_RXFE;  // Rx FIFO not empty
+  return !(UART1_FR_R & UART_FR_RXFE);  // Rx FIFO not empty
 }
 
 inline unsigned char rxChar(void) {
